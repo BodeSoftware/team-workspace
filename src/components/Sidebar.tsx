@@ -1,5 +1,5 @@
 import { ChevronDown, ChevronRight, FileText, Folder, FolderPlus, Home, Plus, Search, Settings, Star, BookTemplate as Template, X } from 'lucide-react';
-import { useEffect, useState, useRef, useCallback, DragEvent } from 'react';
+import { useEffect, useState, useRef, useCallback } from 'react';
 import { clsx } from 'clsx';
 import { useNavigate } from 'react-router-dom';
 import { supabase } from '../lib/supabase';
@@ -15,59 +15,44 @@ interface TreeItem {
   id: string;
   title: string;
   type: 'folder' | 'document';
+  parent_id?: string | null;
+  position: number;
   children?: TreeItem[];
 }
-
-const mockTree: TreeItem[] = [
-  {
-    id: '1',
-    title: 'Getting Started',
-    type: 'document'
-  },
-  {
-    id: '2',
-    title: 'Engineering',
-    type: 'folder',
-    children: [
-      {
-        id: '3',
-        title: 'Architecture',
-        type: 'document'
-      },
-      {
-        id: '4',
-        title: 'Backend',
-        type: 'folder',
-        children: [
-          {
-            id: '5',
-            title: 'API Documentation',
-            type: 'document'
-          }
-        ]
-      }
-    ]
-  }
-];
 
 interface TreeNodeProps {
   item: TreeItem;
   level: number;
   onDelete: (id: string) => Promise<void>;
   onRename: (id: string, newTitle: string) => Promise<void>;
+  onMove: (id: string, parentId: string | null, position: number) => Promise<void>;
   onRefresh: () => Promise<void>;
+  expandedFolders: Set<string>;
+  setExpandedFolders: React.Dispatch<React.SetStateAction<Set<string>>>;
 }
 
-function TreeNode({ item, level, onDelete, onRename, onRefresh }: TreeNodeProps) {
-  const [isExpanded, setIsExpanded] = useState(true);
+function TreeNode({ 
+  item, 
+  level, 
+  onDelete, 
+  onRename, 
+  onMove,
+  onRefresh, 
+  expandedFolders,
+  setExpandedFolders 
+}: TreeNodeProps) {
   const [showContextMenu, setShowContextMenu] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+  const [dropIndicator, setDropIndicator] = useState<'before' | 'inside' | 'after' | null>(null);
   const [contextMenuPosition, setContextMenuPosition] = useState({ x: 0, y: 0 });
   const [isRenaming, setIsRenaming] = useState(false);
   const [newTitle, setNewTitle] = useState(item.title);
   const contextMenuRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const nodeRef = useRef<HTMLDivElement>(null);
+  
+  const isExpanded = expandedFolders.has(item.id);
 
   useEffect(() => {
     const handleClickOutside = (event: MouseEvent) => {
@@ -80,8 +65,22 @@ function TreeNode({ item, level, onDelete, onRename, onRefresh }: TreeNodeProps)
     return () => document.removeEventListener('click', handleClickOutside);
   }, []);
 
+  const toggleExpand = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setExpandedFolders(prev => {
+      const newState = new Set(prev);
+      if (newState.has(item.id)) {
+        newState.delete(item.id);
+      } else {
+        newState.add(item.id);
+      }
+      return newState;
+    });
+  };
+
   const handleContextMenu = (e: React.MouseEvent) => {
     e.preventDefault();
+    e.stopPropagation();
     setContextMenuPosition({ x: e.clientX, y: e.clientY });
     setShowContextMenu(true);
   };
@@ -103,112 +102,249 @@ function TreeNode({ item, level, onDelete, onRename, onRefresh }: TreeNodeProps)
 
   const handleDelete = async () => {
     setShowContextMenu(false);
-    if (confirm('Are you sure you want to delete this document?')) {
+    if (confirm(`Are you sure you want to delete this ${item.type}?`)) {
       await onDelete(item.id);
     }
   };
   
-  const handleDragStart = (e: DragEvent<HTMLDivElement>) => {
+  const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
     e.stopPropagation();
     setIsDragging(true);
-    e.dataTransfer.setData('text/plain', item.id);
+    
+    // Store complete item data
+    e.dataTransfer.setData('application/json', JSON.stringify({
+      id: item.id,
+      type: item.type,
+      title: item.title,
+      parent_id: item.parent_id,
+      position: item.position
+    }));
+    
+    e.dataTransfer.effectAllowed = 'move';
+    
+    // Create a ghost image to show during drag
+    const ghostElement = document.createElement('div');
+    ghostElement.classList.add('bg-white', 'shadow-md', 'rounded', 'p-2', 'text-sm');
+    ghostElement.textContent = item.title;
+    document.body.appendChild(ghostElement);
+    ghostElement.style.position = 'absolute';
+    ghostElement.style.top = '-1000px';
+    
+    e.dataTransfer.setDragImage(ghostElement, 0, 0);
+    
+    // Set timeout to remove the ghost element
+    setTimeout(() => {
+      document.body.removeChild(ghostElement);
+    }, 0);
   };
 
   const handleDragEnd = () => {
     setIsDragging(false);
+    setDropIndicator(null);
   };
 
-  const handleDragOver = (e: DragEvent<HTMLDivElement>) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (item.type === 'folder') {
-      setIsDragOver(true);
+  const determineDropPosition = (e: React.DragEvent<HTMLDivElement>): 'before' | 'inside' | 'after' => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    const y = e.clientY;
+    
+    // Calculate relative position
+    const relativeY = y - rect.top;
+    const height = rect.height;
+    
+    // Top 25% = before, Bottom 25% = after, Middle 50% = inside (if folder)
+    if (relativeY < height * 0.25) {
+      return 'before';
+    } else if (relativeY > height * 0.75) {
+      return 'after';
+    } else if (item.type === 'folder') {
+      return 'inside';
+    } else {
+      // For documents, just determine if it's before or after based on the middle point
+      return relativeY < height * 0.5 ? 'before' : 'after';
     }
   };
 
-  const handleDragLeave = (e: DragEvent<HTMLDivElement>) => {
+  const handleDragOver = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragOver(false);
+    
+    try {
+      // Check if there's valid drag data
+      const dragData = e.dataTransfer.getData('application/json');
+      if (!dragData) return;
+      
+      const draggedItem = JSON.parse(dragData);
+      
+      // Don't allow dropping onto itself
+      if (draggedItem.id === item.id) {
+        setDropIndicator(null);
+        return;
+      }
+      
+      // Don't allow documents to contain other items
+      if (item.type === 'document' && draggedItem.type === 'folder') {
+        setDropIndicator(null);
+        return;
+      }
+      
+      // Determine the drop position
+      const position = determineDropPosition(e);
+      setDropIndicator(position);
+      
+      // Set appropriate drop effect
+      e.dataTransfer.dropEffect = 'move';
+    } catch (error) {
+      // If we can't read the data yet (first dragover event), just set default indicator
+      const position = determineDropPosition(e);
+      setDropIndicator(position);
+      e.dataTransfer.dropEffect = 'move';
+    }
   };
 
-  const handleDrop = async (e: DragEvent<HTMLDivElement>) => {
+  const handleDragLeave = (e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     e.stopPropagation();
-    setIsDragOver(false);
+    setDropIndicator(null);
+  };
 
-    if (item.type !== 'folder') return;
-
-    const draggedId = e.dataTransfer.getData('text/plain');
-    if (draggedId === item.id) return; // Prevent dropping on itself
-
+  const handleDrop = async (e: React.DragEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    
+    // Reset visual states
+    setDropIndicator(null);
+    setDropIndicator(null);
+    
     try {
-      const { error } = await supabase
-        .from('documents')
-        .update({ parent_id: item.id })
-        .eq('id', draggedId);
-
-      if (error) throw error;
-      // Refresh the document tree
-      await onRefresh();
+      // Get the dragged item data
+      const draggedItemJson = e.dataTransfer.getData('application/json');
+      if (!draggedItemJson) return;
+      
+      const draggedItem = JSON.parse(draggedItemJson);
+      if (!draggedItem.id) return;
+      
+      // Don't allow dropping an item onto itself
+      if (draggedItem.id === item.id) return;
+      
+      // Don't allow documents to contain other items
+      if (item.type === 'document' && draggedItem.type === 'folder') return;
+      
+      // Determine drop position
+      const dropPosition = determineDropPosition(e);
+      
+      // Variables to track the new parent and position
+      let newParentId: string | null = null;
+      let newPosition: number = 0;
+      
+      if (dropPosition === 'inside' && item.type === 'folder') {
+        // Dropping inside a folder
+        newParentId = item.id;
+        
+        // Calculate position for inside drop - place at the end of the folder's children
+        // If the folder is empty or collapsed, use position 0
+        if (!item.children || !isExpanded) {
+          newPosition = 0;
+        } else {
+          // Otherwise, find the last item's position and add 1
+          const lastItem = item.children[item.children.length - 1];
+          newPosition = lastItem.position + 1;
+        }
+        
+        // Expand the folder when an item is dropped into it
+        if (!isExpanded) {
+          setExpandedFolders(prev => new Set(prev).add(item.id));
+        }
+      } else {
+        // Dropping before or after an item
+        // The new parent is the same as the current item's parent
+        newParentId = item.parent_id;
+        
+        // Calculate position based on current item's position
+        newPosition = item.position;
+        
+        // If dropping after, increment the position
+        if (dropPosition === 'after') {
+          newPosition += 1;
+        }
+      }
+      
+      // Call the move handler
+      await onMove(draggedItem.id, newParentId, newPosition);
+      
     } catch (error) {
-      console.error('Error moving document:', error);
-      alert('Failed to move document. Please try again.');
+      console.error('Error during drag and drop operation:', error);
+      alert('Failed to move item. Please try again.');
     }
   };
   
   return (
     <div
+      ref={nodeRef}
       draggable
       onDragStart={handleDragStart}
       onDragEnd={handleDragEnd}
       onDragOver={handleDragOver}
       onDragLeave={handleDragLeave}
       onDrop={handleDrop}
+      data-item-id={item.id}
+      data-item-type={item.type}
       className={clsx(
-        'relative',
-        isDragOver && 'bg-indigo-50 rounded'
+        'relative mb-0.5 transition-all duration-200',
+        isDragging && 'opacity-50',
+        dropIndicator === 'before' && 'before:block before:absolute before:w-full before:h-0.5 before:top-0 before:bg-indigo-500 before:rounded-full before:-translate-y-0.5 before:shadow-lg before:animate-pulse',
+        dropIndicator === 'after' && 'after:block after:absolute after:w-full after:h-0.5 after:bottom-0 after:bg-indigo-500 after:rounded-full after:translate-y-0.5 after:shadow-lg after:animate-pulse',
+        dropIndicator === 'inside' && item.type === 'folder' && 'ring-2 ring-indigo-500 ring-inset rounded-md bg-indigo-50/50 shadow-inner'
       )}
     >
-      <button
+      <div
+        onClick={() => item.type === 'folder' && toggleExpand}
         onContextMenu={handleContextMenu}
         className={clsx(
-          'w-full flex items-center py-1 px-2 text-sm rounded hover:bg-gray-100 transition-colors',
-          { 'text-gray-900': item.type === 'folder', 'text-gray-700': item.type === 'document' },
-          isDragging && 'opacity-50'
+          'flex items-center py-1.5 px-2 rounded-md transition-all',
+          !isDragging && 'hover:bg-gray-100 hover:shadow-sm',
+          'active:scale-[0.98] active:bg-gray-200',
+          { 
+            'font-medium': item.type === 'folder',
+            'bg-gray-100': showContextMenu
+          }
         )}
-        style={{ paddingLeft: `${level * 12 + 8}px` }}
       >
-        {item.type === 'folder' ? (
-          <span className="flex items-center">
-            {isExpanded ? (
-              <ChevronDown className="w-4 h-4" onClick={() => setIsExpanded(false)} />
-            ) : (
-              <ChevronRight className="w-4 h-4" onClick={() => setIsExpanded(true)} />
-            )}
-            <Folder className="w-4 h-4 ml-1 mr-2 text-gray-500" />
-          </span>
-        ) : (
-          <FileText className="w-4 h-4 mr-2" />
-        )}
-        {isRenaming ? (
-          <input
-            ref={inputRef}
-            type="text"
-            value={newTitle}
-            onChange={(e) => setNewTitle(e.target.value)}
-            onBlur={handleRename}
-            onKeyDown={(e) => {
-              if (e.key === 'Enter') handleRename();
-              if (e.key === 'Escape') setIsRenaming(false);
-            }}
-            className="flex-1 bg-transparent border-none focus:outline-none focus:ring-1 focus:ring-indigo-500 rounded px-1"
-            onClick={(e) => e.stopPropagation()}
-          />
-        ) : (
-          item.title
-        )}
-      </button>
+        <div style={{ paddingLeft: `${level * 12}px` }} className="flex items-center min-w-0 flex-1">
+          {item.type === 'folder' ? (
+            <span className="flex items-center cursor-pointer" onClick={toggleExpand}>
+              {isExpanded ? (
+                <ChevronDown className="w-4 h-4 text-gray-500 transition-transform" />
+              ) : (
+                <ChevronRight className="w-4 h-4 text-gray-500 transition-transform" />
+              )}
+              <Folder className={clsx(
+                "w-4 h-4 ml-1 mr-2 transition-colors",
+                isExpanded ? "text-indigo-500" : "text-gray-500"
+              )} />
+            </span>
+          ) : (
+            <FileText className="w-4 h-4 mr-2 text-gray-500 transition-colors group-hover:text-indigo-500" />
+          )}
+          
+          {isRenaming ? (
+            <input
+              ref={inputRef}
+              type="text"
+              value={newTitle}
+              onChange={(e) => setNewTitle(e.target.value)}
+              onBlur={handleRename}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleRename();
+                if (e.key === 'Escape') setIsRenaming(false);
+              }}
+              className="flex-1 min-w-0 bg-white border border-gray-300 rounded py-0.5 px-1.5 focus:outline-none focus:ring-2 focus:ring-indigo-500 focus:border-transparent shadow-sm"
+              onClick={(e) => e.stopPropagation()}
+            />
+          ) : (
+            <span className="truncate">{item.title}</span>
+          )}
+        </div>
+      </div>
       
       {showContextMenu && (
         <div
@@ -218,25 +354,27 @@ function TreeNode({ item, level, onDelete, onRename, onRefresh }: TreeNodeProps)
             left: contextMenuPosition.x,
             top: contextMenuPosition.y,
           }}
-          className="bg-white rounded-lg shadow-lg py-1 w-48 z-50 border border-gray-200"
+          className="bg-white rounded-lg shadow-xl py-1 w-48 z-50 border border-gray-200 animate-in fade-in slide-in-from-top-2 duration-200"
         >
           <button
             onClick={startRenaming}
-            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100"
+            className="w-full text-left px-4 py-2 text-sm text-gray-700 hover:bg-gray-100 transition-colors flex items-center gap-2"
           >
+            <span className="text-gray-400">✎</span>
             Rename
           </button>
           <button
             onClick={handleDelete}
-            className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-gray-100"
+            className="w-full text-left px-4 py-2 text-sm text-red-600 hover:bg-red-50 transition-colors flex items-center gap-2"
           >
+            <span className="text-red-400">🗑</span>
             Delete
           </button>
         </div>
       )}
       
-      {item.children && isExpanded && (
-        <div>
+      {item.type === 'folder' && isExpanded && item.children && item.children.length > 0 && (
+        <div className="ml-6 my-0.5">
           {item.children.map((child) => (
             <TreeNode 
               key={child.id}
@@ -244,8 +382,11 @@ function TreeNode({ item, level, onDelete, onRename, onRefresh }: TreeNodeProps)
               level={level + 1}
               onDelete={onDelete}
               onRename={onRename}
-              onRename={onRename}
-              onRefresh={onRefresh} />
+              onMove={onMove}
+              onRefresh={onRefresh}
+              expandedFolders={expandedFolders}
+              setExpandedFolders={setExpandedFolders}
+            />
           ))}
         </div>
       )}
@@ -256,6 +397,7 @@ function TreeNode({ item, level, onDelete, onRename, onRefresh }: TreeNodeProps)
 export default function Sidebar() {
   const [activeTab, setActiveTab] = useState<'pages' | 'templates'>('pages');
   const [documents, setDocuments] = useState<TreeItem[]>([]);
+  const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [showCreateWorkspace, setShowCreateWorkspace] = useState(false);
   const [userHasWorkspace, setUserHasWorkspace] = useState(false);
   const [showCreateMenu, setShowCreateMenu] = useState(false);
@@ -395,6 +537,20 @@ export default function Sidebar() {
       if (!workspace) {
         throw new Error('No workspace found');
       }
+      
+      // Get the maximum position for the new document's parent level
+      let maxPosition = 0;
+      
+      const { data: positionData } = await supabase
+        .from('documents')
+        .select('position')
+        .eq('parent_id', parentId)
+        .order('position', { ascending: false })
+        .limit(1);
+        
+      if (positionData && positionData.length > 0) {
+        maxPosition = positionData[0].position + 1;
+      }
 
       const { data: document, error } = await supabase
         .from('documents')
@@ -403,7 +559,9 @@ export default function Sidebar() {
           workspace_id: workspace.id,
           parent_id: parentId,
           created_by: user.id,
-          content: null
+          content: null,
+          position: maxPosition,
+          is_folder: false
         })
         .select()
         .single();
@@ -448,7 +606,27 @@ export default function Sidebar() {
       if (!workspace) {
         throw new Error('No workspace found');
       }
-
+      
+      // Get the maximum position for folders at this level
+      let maxPosition = 0;
+      
+      const { data: folderPositionData } = await supabase
+        .from('documents')
+        .select('position')
+        .eq('parent_id', parentId)
+        .eq('is_folder', true)
+        .order('position', { ascending: false })
+        .limit(1);
+        
+      if (folderPositionData && folderPositionData.length > 0) {
+        maxPosition = folderPositionData[0].position + 1;
+      }
+      
+      // If there are no folders yet but there are documents, place folder at position 0
+      // and shift all documents down
+      const hasDocuments = await checkHasDocuments(parentId);
+      
+      // Create the new folder
       const { data: folder, error } = await supabase
         .from('documents')
         .insert({
@@ -457,12 +635,22 @@ export default function Sidebar() {
           parent_id: parentId,
           created_by: user.id,
           content: null,
-          is_folder: true
+          is_folder: true,
+          position: maxPosition
         })
         .select()
         .single();
 
       if (error) throw error;
+      
+      // If there are documents and this is the first folder,
+      // we need to reorder the documents to ensure folders stay at the top
+      if (hasDocuments && maxPosition === 0) {
+        await reorderDocumentsAfterNewFolder(parentId);
+      }
+      
+      // Add the new folder to expanded folders state
+      setExpandedFolders(prev => new Set(prev).add(folder.id));
 
       fetchDocuments();
       return folder.id;
@@ -471,6 +659,50 @@ export default function Sidebar() {
       console.error('Error creating folder:', message);
       alert(message);
       return null;
+    }
+  };
+  
+  // Helper function to check if there are documents at a specific level
+  const checkHasDocuments = async (parentId: string | null) => {
+    const { data, error } = await supabase
+      .from('documents')
+      .select('id')
+      .eq('parent_id', parentId)
+      .eq('is_folder', false)
+      .limit(1);
+      
+    return !error && data && data.length > 0;
+  };
+  
+  // Helper function to reorder documents after a new folder is created
+  const reorderDocumentsAfterNewFolder = async (parentId: string | null) => {
+    try {
+      // Get all documents (non-folders) at this level
+      const { data: docs, error } = await supabase
+        .from('documents')
+        .select('id, position')
+        .eq('parent_id', parentId)
+        .eq('is_folder', false)
+        .order('position', { ascending: true });
+        
+      if (error) throw error;
+      
+      if (docs && docs.length > 0) {
+        // Create batch update with new positions
+        const updates = docs.map((doc, index) => ({
+          id: doc.id,
+          position: index + 1 // Start after the folders (position 0)
+        }));
+        
+        // Update all document positions
+        const { error: updateError } = await supabase
+          .from('documents')
+          .upsert(updates);
+          
+        if (updateError) throw updateError;
+      }
+    } catch (error) {
+      console.error('Error reordering documents:', error);
     }
   };
 
@@ -520,6 +752,28 @@ export default function Sidebar() {
     }
   };
 
+  // Improved move function that handles reordering correctly
+  const moveItem = async (id: string, parentId: string | null, position: number) => {
+    try {
+      // Update the document's parent and position
+      const { error: updateError } = await supabase
+        .from('documents')
+        .update({
+          parent_id: parentId,
+          position: position
+        })
+        .eq('id', id);
+        
+      if (updateError) throw updateError;
+
+      // Refresh documents to show the updated structure
+      await fetchDocuments();
+    } catch (error) {
+      console.error('Error moving document:', error);
+      alert('Failed to move document. Please try again.');
+    }
+  };
+
   const fetchDocuments = async () => {
     try {
       if (!user) {
@@ -531,7 +785,7 @@ export default function Sidebar() {
       const { data: documentsData, error } = await supabase
         .from('documents')
         .select('*')
-        .order('created_at', { ascending: true });
+        .order('position', { ascending: true });
 
       if (error) {
         console.error('Documents fetch error:', error);
@@ -553,6 +807,8 @@ export default function Sidebar() {
           id: doc.id,
           title: doc.title,
           type: doc.is_folder ? 'folder' : 'document',
+          parent_id: doc.parent_id,
+          position: doc.position || 0,
           children: []
         });
       });
@@ -576,13 +832,59 @@ export default function Sidebar() {
         }
       });
 
-      setDocuments(tree);
+      // Sort each level: folders first, then documents, both by position
+      const sortByTypeAndPosition = (items: TreeItem[]) => {
+        // First separate folders and documents
+        const folders = items.filter(item => item.type === 'folder');
+        const documents = items.filter(item => item.type === 'document');
+        
+        // Sort each group by position
+        folders.sort((a, b) => a.position - b.position);
+        documents.sort((a, b) => a.position - b.position);
+        
+        // Combine: folders first, then documents
+        const sorted = [...folders, ...documents];
+        
+        // Recursively sort children
+        sorted.forEach(item => {
+          if (item.children && item.children.length > 0) {
+            item.children = sortByTypeAndPosition(item.children);
+          }
+        });
+        
+        return sorted;
+      };
+
+      // Apply sorting to the tree
+      const sortedTree = sortByTypeAndPosition(tree);
+      setDocuments(sortedTree);
+      
+      // Initialize expanded folders state for new folders
+      const shouldExpand = new Set<string>(expandedFolders);
+      const processNode = (node: TreeItem) => {
+        if (node.type === 'folder') {
+          // Auto-expand folders with recent activity or newly created folders
+          if (node.children && node.children.length > 0) {
+            shouldExpand.add(node.id);
+          }
+          
+          // Process children recursively
+          node.children?.forEach(processNode);
+        }
+      };
+      
+      // Process the tree to find folders to expand
+      sortedTree.forEach(processNode);
+      
+      // Update expanded folders state
+      setExpandedFolders(shouldExpand);
     } catch (error) {
       console.error('Error fetching documents:', error);
       setDocuments([]);
     }
   };
-
+  
+  // Initial data loading
   useEffect(() => {
     if (user) {
       checkForWorkspace();
@@ -727,29 +1029,37 @@ export default function Sidebar() {
                   </div>
                 </div>
                 
-                {documents.length > 0 ? (
-                  documents.map((item) => (
-                    <TreeNode
-                      key={item.id}
-                      item={item}
-                      level={0}
-                      onDelete={deleteDocument}
-                      onRename={renameDocument}
-                      onRename={renameDocument}
-                      onRefresh={fetchDocuments} />
-                  ))
-                ) : (
-                  <div className="text-center py-8 text-gray-500">
-                    <FileText className="w-10 h-10 mx-auto text-gray-300 mb-2" />
-                    <p>No documents yet</p>
-                    <button 
-                      onClick={() => createDocument()}
-                      className="mt-2 text-indigo-600 hover:text-indigo-800 text-sm"
-                    >
-                      Create your first document
-                    </button>
-                  </div>
-                )}
+                {/* Document Tree */}
+                <div className="mt-1 pb-4">
+                  {documents.length > 0 ? (
+                    <div className="space-y-0.5">
+                      {documents.map((item) => (
+                        <TreeNode
+                          key={item.id}
+                          item={item}
+                          level={0}
+                          onDelete={deleteDocument}
+                          onRename={renameDocument}
+                          onMove={moveItem}
+                          onRefresh={fetchDocuments}
+                          expandedFolders={expandedFolders}
+                          setExpandedFolders={setExpandedFolders}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <div className="text-center py-8 text-gray-500">
+                      <FileText className="w-10 h-10 mx-auto text-gray-300 mb-2" />
+                      <p>No documents yet</p>
+                      <button 
+                        onClick={() => createDocument()}
+                        className="mt-2 text-indigo-600 hover:text-indigo-800 text-sm"
+                      >
+                        Create your first document
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             ) : (
               <div className="p-4 space-y-2">

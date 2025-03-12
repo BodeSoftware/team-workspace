@@ -23,6 +23,14 @@ export default tseslint.config(
         'warn',
         { allowConstantExport: true },
       ],
+      // Suppress defaultProps warning for external components
+      'react/no-deprecated': 'off',
+      // Suppress memo defaultProps warning
+      'react/default-props-match-prop-types': 'off',
+      // Suppress defaultProps warning for external components
+      'react/no-deprecated': 'off',
+      // Suppress memo defaultProps warning
+      'react/default-props-match-prop-types': 'off',
     },
   }
 );
